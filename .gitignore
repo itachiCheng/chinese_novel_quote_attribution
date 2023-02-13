@@ -1,1 +1,6 @@
 .idea
+model
+txt_data
+output_data
+TagEditor
+__pycache__/

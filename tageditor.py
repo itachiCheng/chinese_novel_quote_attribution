@@ -40,10 +40,10 @@ class TextProcess(object):
     @staticmethod
     def cut_sentence(txt_str):
         txt_str = txt_str.replace("\r", "").replace("\n", "")
-        txt_str = re.sub("([。？！])([^”’])", r"\1\n\2", txt_str)
+        txt_str = re.sub("([；;。？！])([^”’])", r"\1\n\2", txt_str)
         txt_str = re.sub("(\…{2})([^”’])", r"\1\n\2", txt_str)
         txt_str = re.sub("(\.{6})([^’”])", r"\1\n\2", txt_str)
-        txt_str = re.sub("([。？！\…{2}\.{6}][”’])([^。？！])", r"\1\n\2", txt_str)
+        txt_str = re.sub("([。？！\…{2}\.{6}][”’])([^，。？！])", r"\1\n\2", txt_str)
         txt_str = txt_str.strip()
         txt_str = txt_str.replace(" ", "")
         split_txt_str = txt_str.split("\n")
@@ -69,7 +69,7 @@ class DiaTextProcess(TextProcess):
     def __init__(self, files_path, ner_model, output_path):
         super(DiaTextProcess, self).__init__(files_path)
         self.tokenizer = AutoTokenizer.from_pretrained(ner_model)
-        self.model = AutoModelForTokenClassification.from_pretrained(ner_model)
+        self.model = AutoModelForTokenClassification.from_pretrained(ner_model).to(Configuration.device)
         self.output_path = output_path
 
     @classmethod
@@ -109,7 +109,7 @@ class DiaTextProcess(TextProcess):
             dialogue_pos = [index for index, value in enumerate(tags_list)
                             if value == "dialogue"]
             dialogue_pos_len = len(dialogue_pos)
-            if dialogue_pos_len % 2:
+            if not dialogue_pos_len or dialogue_pos_len % 2:
                 continue
             ## 对话人物标定模式 A -“A” B - “B” C - "C" - C, 其中“”代表对话引用， 相同字母代表相关标注。
             tmp_pos = []
@@ -126,7 +126,10 @@ class DiaTextProcess(TextProcess):
                     srt_dialog_pos = min(srt_dialog_pos, dialogue_pos_len - 2)
                     dia_key = str(dialogue_pos[srt_dialog_pos]) + '_' \
                               + str(dialogue_pos[srt_dialog_pos + 1])
-                    pre_dialogue_tag = 1- pre_dialogue_tag
+                    pre_dialogue_tag = 1 - pre_dialogue_tag
+                    continue
+                elif tag == "dialogue" and not pre_dialogue_tag:
+                    pre_dialogue_tag = 1 - pre_dialogue_tag
                     continue
                 if tag:
                     tmp_pos.append(pos)
@@ -136,12 +139,12 @@ class DiaTextProcess(TextProcess):
             if tmp_pos:
                 dict_dialog_pos[dia_key].append(tmp_pos)
             for key, value in dict_dialog_pos.items():
-                yield key, value, tags_list
+                yield key, value, tags_list, content
 
     @classmethod
     def generate_train_sample(cls, sample_file, output_train):
         id_next = 0
-        for key, value, tags_list in cls.split_sample(sample_file):
+        for key, value, tags_list, content in cls.split_sample(sample_file):
             srt, end = key.split('_')
             for ner_pos in value:
                 init_tags = [''] * len(tags_list)
@@ -149,9 +152,10 @@ class DiaTextProcess(TextProcess):
                 init_tags[int(end)] = "dialogue"
                 for pos in ner_pos:
                     init_tags[pos] = tags_list[pos]
+                content["tags"] = init_tags
                 with open(
                         os.path.join(output_train, "%06d_train.json" % id_next), "w", encoding="utf8") as fp:
-                    json.dump(init_tags, fp, ensure_ascii=False)
+                    json.dump([content], fp, ensure_ascii=False)
                     id_next += 1
     '''
         NER模型直接得到的是实体数字标签【1】，需要通过计算过滤出人物【1】，同时转换数字序列为字符序列【2】【3】。
@@ -182,14 +186,18 @@ class DiaTextProcess(TextProcess):
     def _generate_mask_ner(self):
         for input_txt in tqdm(DiaTextProcess.read_sentence(self.files_list)):
             inputs = self.tokenizer(input_txt, padding=True, return_tensors='pt')
+            inputs = inputs.to(Configuration.device)
             output = torch.argmax(self.model(**inputs).logits, dim=-1)
-            outputs = F.one_hot(output).short()
+            outputs = F.one_hot(output)
+            outputs = outputs.to(Configuration.device)
             padder = torch.zeros(
                 outputs.size()[0], outputs.size()[1],
                 len(Configuration.label_list) - outputs.size()[2]
-            ).short()
+            )
+            padder = padder.to(Configuration.device)
             outputs_all = torch.cat([outputs, padder], dim=-1)
-            label_list = torch.Tensor([Configuration.label_list]).short()
+            label_list = torch.Tensor([Configuration.label_list])
+            label_list = label_list.to(Configuration.device)
             mask_ner = torch.matmul(
                 outputs_all, label_list.T
             ).squeeze(-1).tolist()
@@ -214,6 +222,8 @@ class DiaTextProcess(TextProcess):
                     mask_ner[index] = self._rep_mask_by_rule(
                         txt, rule, mask_ner[index]
                     )
+                if len(txt) != len(mask_ner[index]):
+                    continue
                 words = list(txt)
                 dict_sent["words"] += words
                 dict_sent["text"] += " ".join(words)
@@ -226,27 +236,11 @@ class DiaTextProcess(TextProcess):
                 dict_sent["tags"][1] = "false_role"
                 dict_sent["tags"][2] = "dialogue"
                 dict_sent["sent_starts"][0] = True
-            except KeyError as error:
-                raise Exception("No Key") from error
+            except IndexError:
+                continue
             if id_next % 30 == 0 and id_next:
                 with open(os.path.join(self.output_path, "%06d.json" % id_next), "w", encoding="utf8") as f:
                     json.dump(list_samples, f, ensure_ascii=False)
                 list_samples = []
             list_samples.append(dict_sent)
             id_next += 1
-
-
-
-
-
-
-
-
-
-
-
-
-
-if __name__ == "__main__":
-    for sentence in TextProcess.cut_sentence("国歌在许多场合被使用，常在国定假日演奏，也常在体育竞赛中使用，以唤起或表达国民的爱国情绪。在升降旗仪式上，国歌通常作为升降国旗时所演奏的乐曲。大部分国家，作为爱国教育的一部分，学校对学生演奏国歌。泰国和中华民国曾规定在剧院或电影院正式放映前应演奏国歌或王室颂歌。在大型国际比赛如足球、橄榄球赛事时通常会演奏双方国歌。中华人民共和国、美国、加拿大等一些国家在本国的体育赛事开赛前也常会演唱国歌。于奥林匹克运动会、世界锦标赛颁发奖牌时，会演奏金牌得主国国歌。"):
-        print(sentence)
