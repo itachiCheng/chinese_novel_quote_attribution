@@ -1,1 +1,1 @@
-# chinese_novel_quote_attribution
+# chinese-novel-quote-attribution
